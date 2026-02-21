@@ -179,6 +179,8 @@ class Worker:
         self.states = {}
         self.work_dir = (work_dir,)
         self.all_worker_handles = all_worker_handles or {}
+        self._dit_only_encode_stage_prototype: Optional[Dict[str, torch.Tensor]] = None
+        self._dit_only_batch_scales: Dict[str, int] = {}
 
     def init_static_env(
         self, world_size: int, ranks: List[int] = [], engine_config: EngineConfig = None
@@ -477,6 +479,88 @@ class Worker:
                     "All NIXL agents created, peered and caches registered (serialized)."
                 )
 
+        if self.engine_config.runtime_config.dit_only:
+            self._init_dit_only_encode_stage_prototype(model_class)
+
+    def _get_dit_only_dummy_input_config(self, model_class) -> InputConfig:
+        if model_class == HunyuanVideoPipeline:
+            height, width, num_frames = 720, 1280, 129
+        elif model_class == CogVideoXPipeline:
+            height, width, num_frames = 768, 1360, 49
+        else:
+            height, width, num_frames = 1024, 1024, 1
+
+        return InputConfig(
+            height=height,
+            width=width,
+            num_frames=num_frames,
+            prompt="DiT_Only_Dummy_Prompt",
+            negative_prompt="",
+            num_inference_steps=1,
+            max_sequence_length=256,
+            output_type="latent",
+        )
+
+    def _init_dit_only_encode_stage_prototype(self, model_class) -> None:
+        if self._dit_only_encode_stage_prototype is not None:
+            return
+
+        dummy_input = self._get_dit_only_dummy_input_config(model_class)
+        logger.info(
+            "Initializing dit_only encode prototype for rank=%s, model=%s",
+            self.rank,
+            model_class.__name__,
+        )
+        prototype = self.execute_encode_stage(
+            engine_config=self.engine_config,
+            input_config=dummy_input,
+            model_class=model_class,
+            task_id="dit_only_prototype",
+        )
+        if prototype is None:
+            raise RuntimeError("Failed to build dit_only encode prototype")
+
+        self._dit_only_encode_stage_prototype = {}
+        self._dit_only_batch_scales = {}
+        base_batch = max(1, dummy_input.batch_size)
+        for key, value in prototype.items():
+            if not torch.is_tensor(value):
+                continue
+            tensor = value.detach().cpu().contiguous()
+            self._dit_only_encode_stage_prototype[key] = tensor
+            if key == "text_ids":
+                self._dit_only_batch_scales[key] = 0
+            elif tensor.ndim > 0 and tensor.shape[0] % base_batch == 0:
+                self._dit_only_batch_scales[key] = tensor.shape[0] // base_batch
+            else:
+                self._dit_only_batch_scales[key] = 0
+
+    @staticmethod
+    def _expand_batch_tensor(tensor: torch.Tensor, target_batch_dim0: int) -> torch.Tensor:
+        if tensor.shape[0] == target_batch_dim0:
+            return tensor.clone()
+        repeat_factor = (target_batch_dim0 + tensor.shape[0] - 1) // tensor.shape[0]
+        repeat_shape = [1] * tensor.ndim
+        repeat_shape[0] = repeat_factor
+        return tensor.repeat(*repeat_shape)[:target_batch_dim0].clone()
+
+    def _build_dit_only_encode_stage_results(
+        self, input_config: InputConfig
+    ) -> Dict[str, torch.Tensor]:
+        if self._dit_only_encode_stage_prototype is None:
+            raise RuntimeError("dit_only encode prototype is not initialized")
+
+        batch_size = max(1, input_config.batch_size)
+        results = {}
+        for key, prototype in self._dit_only_encode_stage_prototype.items():
+            batch_scale = self._dit_only_batch_scales.get(key, 0)
+            if batch_scale > 0 and prototype.ndim > 0:
+                target_dim0 = batch_scale * batch_size
+                results[key] = self._expand_batch_tensor(prototype, target_dim0)
+            else:
+                results[key] = prototype.clone()
+        return results
+
     def switch_parallel_env(
         self, world_size: int, ranks: List[int] = [], engine_config: EngineConfig = None
     ) -> None:
@@ -607,6 +691,27 @@ class Worker:
         """
         Run the all pipeline, need to modify to do 3 stage separate
         """
+        engine_config = engine_config or self.engine_config
+        if engine_config.runtime_config.dit_only:
+            if self._dit_only_encode_stage_prototype is None:
+                self._init_dit_only_encode_stage_prototype(model_class)
+            input_config.output_type = "latent"
+            encode_stage_results = self._build_dit_only_encode_stage_results(
+                input_config
+            )
+            diffusion_results = self.execute_diffusion_stage(
+                encode_stage_results=encode_stage_results,
+                engine_config=engine_config,
+                input_config=input_config,
+                model_class=model_class,
+                task_id=task_id,
+            )
+            if diffusion_results is None:
+                return None
+            if isinstance(diffusion_results, tuple):
+                return diffusion_results[0]
+            return diffusion_results
+
         get_runtime_state().set_p2p_state("computing")
         t1 = global_profiler.timer()
 

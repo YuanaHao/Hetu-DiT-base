@@ -39,6 +39,7 @@ results_store = {}
 
 PROFILE_ON_STARTUP = False
 PROFILE_REPEAT_TIMES = 1
+DIT_ONLY_DUMMY_PROMPT = "DiT_Only_Dummy_Prompt"
 
 
 def _update_result(task_id: str, *, status: str, output: Optional[str] = None) -> None:
@@ -46,6 +47,20 @@ def _update_result(task_id: str, *, status: str, output: Optional[str] = None) -
     results_store[task_id]["status"] = status
     if output is not None:
         results_store[task_id]["output"] = output
+
+
+def _apply_dit_only_input(input_config: InputConfig, is_profiler: bool = False) -> None:
+    if not engine.engine_config.runtime_config.dit_only:
+        return
+    dummy_prompt = "Model_Profiler" if is_profiler else DIT_ONLY_DUMMY_PROMPT
+    if isinstance(input_config.prompt, list):
+        batch_size = len(input_config.prompt)
+        input_config.prompt = [dummy_prompt] * batch_size
+        input_config.negative_prompt = [""] * batch_size
+    else:
+        input_config.prompt = dummy_prompt
+        input_config.negative_prompt = ""
+    input_config.output_type = "latent"
 
 
 _parallel_strategy_cache = None
@@ -455,6 +470,7 @@ async def generate(request: Request):
         task_id=task_id,
         machine_id=machine_id,
     )
+    _apply_dit_only_input(input_config)
 
     # Add request to the queue
     scheduler.record_start_time(task_id)
@@ -558,6 +574,7 @@ async def generate_with_workers(request: Request):
         seed=seed,
         task_id=task_id,
     )
+    _apply_dit_only_input(input_config)
 
     # Queue the request and get future
     future = asyncio.Future()
@@ -595,6 +612,22 @@ async def generate_image(
         f"Starting image generation for prompt: {input_config.prompt}, height = {input_config.height}, width = {input_config.width}"
     )
     torch.cuda.empty_cache()
+
+    if (
+        engine.engine_config.runtime_config.dit_only
+        and search_mode != "fix"
+        and (engine.use_disaggregated_encode_decode or engine.stage_level)
+    ):
+        logger.debug(
+            "dit_only is enabled, disaggregated/stage-level path is disabled; using run_task"
+        )
+        await engine.run_task(
+            input_config=input_config,
+            engine_config=engine_config,
+            task_id=task_id,
+            machine_id=machine_id,
+        )
+        return "success"
 
     # Run the engine
     if search_mode == "random" and engine.use_disaggregated_encode_decode:
@@ -722,6 +755,7 @@ def create_engine(args: argparse.Namespace) -> AsyncServingEngine:
         use_torch_compile=args.use_torch_compile,
         use_onediff=args.use_onediff,
         adjust_strategy=args.adjust_strategy,
+        dit_only=args.dit_only,
         # machine id
         machine_num=args.machine_nums,
         use_disaggregated_encode_decode=args.use_disaggregated_encode_decode,
@@ -847,6 +881,10 @@ def main():
 
     PROFILE_ON_STARTUP = args.profile_on_startup
     PROFILE_REPEAT_TIMES = max(1, args.profile_repeat)
+    if args.dit_only:
+        logger.info(
+            "dit_only mode enabled: requests will use dummy prompts and run diffusion only"
+        )
 
     if torch.cuda.is_available():
         device_name = torch.cuda.get_device_name(0)
@@ -1139,7 +1177,11 @@ async def profile_task(repeat_times=1):
                     width=width,
                     num_frames=num_frames,
                     num_inference_steps=engine.model_profiler.steps,
+                    output_type="latent"
+                    if engine.engine_config.runtime_config.dit_only
+                    else "pil",
                 )
+                _apply_dit_only_input(input_config, is_profiler=True)
                 task_id = f"parallel_{parallel_config}_height_{height}_width_{width}_frame_{num_frames}_batchsize_{j}"
 
                 for _ in range(

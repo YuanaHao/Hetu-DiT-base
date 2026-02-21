@@ -67,6 +67,7 @@ class hetuDiTArgs:
     use_torch_compile: bool = False
     use_onediff: bool = False
     adjust_strategy: str = "cache"
+    dit_only: bool = False
     # Parallel arguments
     # data parallel
     data_parallel_degree: int = 1
@@ -164,6 +165,11 @@ class hetuDiTArgs:
             default="cache",
             choices=["base", "cache", "p2p"],
             help="Execution strategy (base, cache, p2p). Default is cache.",
+        )
+        runtime_group.add_argument(
+            "--dit_only",
+            action="store_true",
+            help="Skip text-encode and VAE decode stages, run DiT diffusion only.",
         )
 
         # Parallel arguments
@@ -345,6 +351,7 @@ class hetuDiTArgs:
             use_onediff=self.use_onediff,
             adjust_strategy=self.adjust_strategy,
             use_parallel_text_encoder=self.use_parallel_text_encoder,
+            dit_only=self.dit_only,
         )
 
         # Text encoder parallel

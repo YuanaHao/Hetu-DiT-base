@@ -66,6 +66,8 @@ class RuntimeConfig:
     adjust_strategy: str = "cache"
     # Text encoder parallel
     use_parallel_text_encoder: bool = False
+    # Denoise-only mode: skip text-encode and VAE decode, run DiT only.
+    dit_only: bool = False
 
     def __post_init__(self):
         check_packages()
