@@ -61,6 +61,47 @@ def _configure_random_parallel(
     return _sync_parallel_config(parallel_config)
 
 
+def _build_t_jk(
+    allowed_machine_counts: List[int],
+    priority: int,
+    t_dict: Optional[Dict[int, float]] = None,
+    fallback_table: Optional[Dict[Tuple[int, int], Tuple[float, Tuple[int, int, int, int]]]] = None,
+    default_time: float = 8.0,
+) -> Dict[int, int]:
+    """Build per-degree execution times, preferring profile data when available."""
+    prof_times: Dict[int, float] = {}
+    if t_dict:
+        for k, v in t_dict.items():
+            try:
+                degree = int(k)
+                latency = float(v)
+            except (TypeError, ValueError):
+                continue
+            if degree > 0 and latency > 0:
+                prof_times[degree] = latency
+
+    if prof_times:
+        sorted_degrees = sorted(prof_times)
+        out: Dict[int, int] = {}
+        for k in allowed_machine_counts:
+            if k in prof_times:
+                latency = prof_times[k]
+            else:
+                closest_degree = min(sorted_degrees, key=lambda d: abs(d - k))
+                latency = prof_times[closest_degree]
+            out[k] = max(1, int(round(latency)))
+        return out
+
+    out: Dict[int, int] = {}
+    for k in allowed_machine_counts:
+        if fallback_table is not None:
+            latency, _ = fallback_table.get((priority, k), (default_time, (1, 1, 1, 1)))
+        else:
+            latency = default_time
+        out[k] = max(1, int(round(latency)))
+    return out
+
+
 def _select_machine_with_capacity(m_free: List[int], required: int) -> Optional[int]:
     """Return machine index with sufficient free GPUs and maximum remaining capacity."""
     capable = [idx for idx, free in enumerate(m_free) if free >= required]
@@ -224,15 +265,18 @@ class ILP_fix_Strategy(SchedulingStrategy):
             (1048576, 8): (10.829527, (1, 1, 1, 8)),
         }
 
-    async def put(self, queue, priority: int, item: Any):
+    async def put(self, queue, priority: int, item: Any, t_dict=None):
         task_id, input_config, engine_config, future, worker_ids = item
         q_min = 1
         r_j = time.time()
         d_j = r_j + random.randint(12, 30)
-        t_jk = {}
-        for k in self.allowed_machine_counts:
-            t, _ = self.priority_k_table.get((priority, k), (8, (1, 1, 1, 8)))
-            t_jk[k] = int(round(t))
+        t_jk = _build_t_jk(
+            self.allowed_machine_counts,
+            priority,
+            t_dict=t_dict,
+            fallback_table=self.priority_k_table,
+            default_time=8.0,
+        )
         task = {
             "id": task_id,
             "q_min": q_min,
@@ -647,15 +691,18 @@ class ILP_random_Strategy(SchedulingStrategy):
             (16320, 8): (0.840336134, (8, 1, 1, 1)),
         }
 
-    async def put(self, queue, priority: int, item: Any):
+    async def put(self, queue, priority: int, item: Any, t_dict=None):
         task_id, input_config, engine_config = item
         q_min = 1
         r_j = time.time()
         d_j = r_j + 20
-        t_jk = {}
-        for k in self.allowed_machine_counts:
-            t, _ = self.priority_k_table.get((priority, k), (8, (1, 1, 1, 1)))
-            t_jk[k] = int(round(t))
+        t_jk = _build_t_jk(
+            self.allowed_machine_counts,
+            priority,
+            t_dict=t_dict,
+            fallback_table=self.priority_k_table,
+            default_time=8.0,
+        )
         task = {
             "id": task_id,
             "q_min": q_min,
@@ -968,15 +1015,18 @@ class GreedyRandomStrategy(SchedulingStrategy):
             (1048576, 8): (10.829527, (1, 1, 1, 8)),
         }
 
-    async def put(self, queue, priority: int, item: Any):
+    async def put(self, queue, priority: int, item: Any, t_dict=None):
         task_id, input_config, engine_config = item
         q_min = 1
         r_j = time.time()
         d_j = r_j + 20
-        t_jk = {}
-        for k in self.allowed_machine_counts:
-            t, _ = self.priority_k_table.get((priority, k), (8, (1, 1, 1, 1)))
-            t_jk[k] = int(round(t))
+        t_jk = _build_t_jk(
+            self.allowed_machine_counts,
+            priority,
+            t_dict=t_dict,
+            fallback_table=self.priority_k_table,
+            default_time=8.0,
+        )
         task = {
             "id": task_id,
             "q_min": q_min,
@@ -1077,15 +1127,18 @@ class ILP_makespan_Strategy(SchedulingStrategy):
             (1048576, 8): (10.829527, (1, 1, 1, 8)),
         }
 
-    async def put(self, queue, priority: int, item: Any):
+    async def put(self, queue, priority: int, item: Any, t_dict=None):
         task_id, input_config, engine_config, future, worker_ids = item
         q_min = 1
         r_j = time.time()
         d_j = r_j + 20
-        t_jk = {}
-        for k in self.allowed_machine_counts:
-            t, _ = self.priority_k_table.get((priority, k), (8, (1, 1, 1, 1)))
-            t_jk[k] = int(round(t))
+        t_jk = _build_t_jk(
+            self.allowed_machine_counts,
+            priority,
+            t_dict=t_dict,
+            fallback_table=self.priority_k_table,
+            default_time=8.0,
+        )
         task = {
             "id": task_id,
             "q_min": q_min,
@@ -1906,14 +1959,7 @@ class Scheduler:
                 task_id, input_config, engine_config = original_item
                 num_workers = assigned_machine_count
                 parallel_config = engine_config.parallel_config
-                degrees = self._map_parallel_degrees(priority, num_workers)
-                _configure_random_parallel(
-                    parallel_config,
-                    ulysses_degree=degrees[0],
-                    ring_degree=degrees[1],
-                    tp_degree=degrees[2],
-                    pp_degree=degrees[3],
-                )
+                _configure_splitk_parallel(parallel_config, num_workers)
                 return priority, (task_id, input_config, engine_config)
             else:
                 return priority, item
@@ -1928,14 +1974,7 @@ class Scheduler:
             task_id, input_config, engine_config, future, worker_ids = item
             num_workers = len(worker_ids)
             parallel_config = engine_config.parallel_config
-            degrees = self._map_parallel_degrees(priority, num_workers)
-            _configure_random_parallel(
-                parallel_config,
-                ulysses_degree=degrees[0],
-                ring_degree=degrees[1],
-                tp_degree=degrees[2],
-                pp_degree=degrees[3],
-            )
+            _configure_splitk_parallel(parallel_config, num_workers)
             return priority, (task_id, input_config, engine_config, future, worker_ids)
         else:
             raise ValueError(f"Unknown search mode: {self.search_mode}")

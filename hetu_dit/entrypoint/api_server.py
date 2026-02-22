@@ -1,6 +1,6 @@
 import argparse
 import ssl
-from typing import Any, Optional
+from typing import Any, Dict, Optional
 import time
 import torch
 from fastapi import FastAPI, Request
@@ -26,7 +26,7 @@ import threading
 from hetu_dit.model_profiler import ModelProfiler
 from hetu_dit.profiler import global_profiler
 from tqdm.asyncio import tqdm
-from hetu_dit.utils import create_new_config, make_profile_key
+from hetu_dit.utils import create_new_config
 
 from hetu_dit.entrypoint.utils import get_loopback_host
 
@@ -83,6 +83,66 @@ def _schedule_task(coro: Any, *, description: str) -> asyncio.Task:
     task = asyncio.create_task(coro)
     logger.debug("Scheduled %s; total tasks=%d", description, len(asyncio.all_tasks()))
     return task
+
+
+def _normalize_profile_t_dict(
+    raw_t_dict: Dict[int, float], num_inference_steps: int
+) -> Dict[int, float]:
+    normalized: Dict[int, float] = {}
+    for k, v in raw_t_dict.items():
+        try:
+            degree = int(k)
+            latency = float(v)
+        except (TypeError, ValueError):
+            continue
+        if degree <= 0 or latency <= 0:
+            continue
+        normalized[degree] = latency * num_inference_steps
+    return dict(sorted(normalized.items()))
+
+
+def _query_profile_t_dict(
+    height: int, width: int, num_frames: int, num_inference_steps: int
+) -> Dict[int, float]:
+    model_name = engine.model_class_name
+    profile_key = f"{height}-{width}-{num_frames}"
+    try:
+        raw_t_dict = engine.model_profiler.get_performance_data(model_name, profile_key)
+    except Exception as exc:
+        logger.warning(
+            "[API Server] Failed to query profile data for key %s: %s. Falling back to default timings.",
+            profile_key,
+            exc,
+        )
+        raw_t_dict = {1: 8.0, 2: 4.0, 4: 2.0, 8: 1.0}
+
+    normalized = _normalize_profile_t_dict(raw_t_dict, num_inference_steps)
+    if normalized:
+        return normalized
+
+    # Keep scheduling functional even when user passes 0 steps or invalid profile values.
+    fallback_base = max(1, num_inference_steps)
+    return {
+        1: float(fallback_base),
+        2: max(1.0, fallback_base / 2),
+        4: max(1.0, fallback_base / 4),
+        8: max(1.0, fallback_base / 8),
+    }
+
+
+def _pick_best_parallel_degree(
+    profile_t_dict: Optional[Dict[int, float]], max_degrees: int
+) -> Optional[int]:
+    if not profile_t_dict:
+        return None
+    candidates = [
+        (int(k), float(v))
+        for k, v in profile_t_dict.items()
+        if int(k) > 0 and int(k) <= max_degrees and float(v) > 0
+    ]
+    if not candidates:
+        return None
+    return min(candidates, key=lambda kv: kv[1])[0]
 
 
 def find_machine_ilde_num(
@@ -423,7 +483,10 @@ async def generate(request: Request):
     else:
         num_visible_gpus = len(cuda_visible_devices.split(","))
 
-    # The parallelism parameter is automatically determined based on the input size.
+    # The parallelism parameter is automatically determined based on profile data.
+    profile_t_dict = _query_profile_t_dict(
+        height, width, num_frames, num_inference_steps
+    )
     (
         data_parallel_degree,
         use_cfg_parallel,
@@ -438,6 +501,7 @@ async def generate(request: Request):
         num_frames,
         num_visible_gpus,
         engine.engine_config.runtime_config.use_parallel_text_encoder,
+        profile_t_dict=profile_t_dict,
     )
     logger.debug(
         f"The parallel degree is determined as: data_parallel_degree={data_parallel_degree}, use_cfg_parallel={use_cfg_parallel}, ulysses_degree={ulysses_degree}, ring_degree={ring_degree}, tensor_parallel_degree={tensor_parallel_degree}, pipefusion_parallel_degree={pipefusion_parallel_degree}"
@@ -480,18 +544,9 @@ async def generate(request: Request):
         else (height * width) // (16 * 16)
     )
     start_time = time.time()
-    if (
-        engine.search_mode == "efficient_ilp"
-        or engine.search_mode == "multi_machine_efficient_ilp"
-        or engine.search_mode == "greedy_splitk"
-    ):
-        model_name = engine.model_class_name
-        profile_key = make_profile_key(input_config)
-        t_dict = engine.model_profiler.get_performance_data(model_name, profile_key)
-        t_dict = {k: v * input_config.num_inference_steps for k, v in t_dict.items()}
-        await scheduler.put(priority, (task_id, input_config, engine_config), t_dict)
-    else:
-        await scheduler.put(priority, (task_id, input_config, engine_config))
+    await scheduler.put(
+        priority, (task_id, input_config, engine_config), profile_t_dict
+    )
     results_store[task_id] = {"status": "queued"}
 
     return JSONResponse(
@@ -532,7 +587,10 @@ async def generate_with_workers(request: Request):
     else:
         num_visible_gpus = len(cuda_visible_devices.split(","))
 
-    # The parallelism parameter is automatically determined based on the input size.
+    # The parallelism parameter is automatically determined based on profile data.
+    profile_t_dict = _query_profile_t_dict(
+        height, width, num_frames, num_inference_steps
+    )
     (
         data_parallel_degree,
         use_cfg_parallel,
@@ -549,6 +607,7 @@ async def generate_with_workers(request: Request):
         num_visible_gpus,
         total_request,
         engine.engine_config.runtime_config.use_parallel_text_encoder,
+        profile_t_dict=profile_t_dict,
     )
     logger.debug(
         f"The parallel degree is determined as: data_parallel_degree={data_parallel_degree}, use_cfg_parallel={use_cfg_parallel}, ulysses_degree={ulysses_degree}, ring_degree={ring_degree}, tensor_parallel_degree={tensor_parallel_degree}, pipefusion_parallel_degree={pipefusion_parallel_degree}"
@@ -585,7 +644,9 @@ async def generate_with_workers(request: Request):
         else (height * width) // (16 * 16)
     )
     await scheduler.put(
-        priority, (task_id, input_config, engine_config, future, worker_ids)
+        priority,
+        (task_id, input_config, engine_config, future, worker_ids),
+        profile_t_dict,
     )
     total_request += 1
     results_store[task_id] = {"status": "queued"}
@@ -927,6 +988,7 @@ def determine_parallel_degrees_with_worker_ids(
     max_degrees: int = 8,
     request_num=0,
     use_text_encoder_parallel=False,
+    profile_t_dict: Optional[Dict[int, float]] = None,
 ):
     """
     Determine parallelism parameters based on input image resolution.
@@ -946,35 +1008,42 @@ def determine_parallel_degrees_with_worker_ids(
     tensor_parallel_degree = 1
     pipefusion_parallel_degree = 1
 
-    # Random ruled candidates in order: (condition, new degrees tuple)
-    if num_frames <= 1:
-        rules = [
-            (img_size <= 256 * 128, (2, 1, 1, 1)),  # default
-            (img_size <= 256 * 256, (2, 1, 1, 1)),  # ulysses=2 2111
-            (img_size <= 256 * 512, (1, 2, 1, 1)),  # ulysses=2, pipefusion=2 2112
-            (img_size <= 512 * 512, (1, 1, 2, 1)),  # ulysses=2, ring=2 2211
-            (img_size <= 1024 * 512, (1, 2, 1, 1)),  # tensor=2, pipefusion=2 1122
-            (True, (2, 1, 1, 1)),  # ulysses=2, ring=2, pipefusion=2 2212
-        ]
+    best_degree = _pick_best_parallel_degree(profile_t_dict, max_degrees)
+    if best_degree is not None:
+        ulysses_degree = best_degree
+        ring_degree = 1
+        tensor_parallel_degree = 1
+        pipefusion_parallel_degree = 1
     else:
-        rules = [
-            (img_size <= 192 * 912 * 9, (2, 1, 1, 1)),  # default
-            (img_size <= 192 * 384 * 9, (2, 1, 1, 1)),  # ulysses=2 2111
-            (img_size <= 384 * 384 * 9, (1, 2, 1, 1)),  # ulysses=4, 4111
-            (img_size <= 768 * 384 * 9, (1, 2, 1, 1)),  # ulysses=2, ring=2 2211
-            (img_size <= 768 * 768 * 9, (1, 1, 2, 1)),  # tensor=4, 1141
-            (True, (1, 1, 2, 1)),  # ulysses=2, ring=4, pipefusion=2 2411
-        ]
+        # Random ruled candidates in order: (condition, new degrees tuple)
+        if num_frames <= 1:
+            rules = [
+                (img_size <= 256 * 128, (2, 1, 1, 1)),  # default
+                (img_size <= 256 * 256, (2, 1, 1, 1)),  # ulysses=2 2111
+                (img_size <= 256 * 512, (1, 2, 1, 1)),  # ulysses=2, pipefusion=2 2112
+                (img_size <= 512 * 512, (1, 1, 2, 1)),  # ulysses=2, ring=2 2211
+                (img_size <= 1024 * 512, (1, 2, 1, 1)),  # tensor=2, pipefusion=2 1122
+                (True, (2, 1, 1, 1)),  # ulysses=2, ring=2, pipefusion=2 2212
+            ]
+        else:
+            rules = [
+                (img_size <= 192 * 912 * 9, (2, 1, 1, 1)),  # default
+                (img_size <= 192 * 384 * 9, (2, 1, 1, 1)),  # ulysses=2 2111
+                (img_size <= 384 * 384 * 9, (1, 2, 1, 1)),  # ulysses=4, 4111
+                (img_size <= 768 * 384 * 9, (1, 2, 1, 1)),  # ulysses=2, ring=2 2211
+                (img_size <= 768 * 768 * 9, (1, 1, 2, 1)),  # tensor=4, 1141
+                (True, (1, 1, 2, 1)),  # ulysses=2, ring=4, pipefusion=2 2411
+            ]
 
-    for condition, (uly, ring, tensor, pipe) in rules:
-        if condition:
-            total_degree = data_parallel_degree * uly * ring * tensor * pipe
-            if total_degree <= max_degrees:
-                ulysses_degree = uly
-                ring_degree = ring
-                tensor_parallel_degree = tensor
-                pipefusion_parallel_degree = pipe
-            break  # Only apply the first matching rule
+        for condition, (uly, ring, tensor, pipe) in rules:
+            if condition:
+                total_degree = data_parallel_degree * uly * ring * tensor * pipe
+                if total_degree <= max_degrees:
+                    ulysses_degree = uly
+                    ring_degree = ring
+                    tensor_parallel_degree = tensor
+                    pipefusion_parallel_degree = pipe
+                break  # Only apply the first matching rule
     needed_workers = (
         data_parallel_degree
         * ulysses_degree
@@ -982,7 +1051,7 @@ def determine_parallel_degrees_with_worker_ids(
         * tensor_parallel_degree
         * pipefusion_parallel_degree
     )
-    worker_ids = sorted(random.sample(range(max_degrees - 1), needed_workers))
+    worker_ids = sorted(random.sample(range(max_degrees), needed_workers))
     logger.debug(
         f" in determine_parallel_degrees_with_worker_ids worker_ids = {worker_ids}"
     )
@@ -1032,6 +1101,7 @@ def determine_parallel_degrees(
     num_frames: int,
     max_degrees: int = 8,
     use_text_encoder_parallel: bool = False,
+    profile_t_dict: Optional[Dict[int, float]] = None,
 ):
     """
     Determine parallelism parameters based on input image resolution.
@@ -1051,67 +1121,74 @@ def determine_parallel_degrees(
     tensor_parallel_degree = 1
     pipefusion_parallel_degree = 1
 
-    # Random Ruled candidates in order: (condition, new degrees tuple)
-    if engine.model_class == HunyuanDiTPipeline:
-        rules = [
-            (img_size <= 768 * 768, (1, 1, 1, 1)),  # default
-            (img_size <= 1024 * 1024, (2, 1, 1, 1)),  # ulysses=2, ring=2 2211
-            (img_size <= 2048 * 2048, (4, 1, 1, 1)),  # tensor=2, pipefusion=2 1122
-            (True, (8, 1, 1, 1)),  # ulysses=2, ring=2, pipefusion=2 2212
-        ]
-    elif engine.model_class == StableDiffusion3Pipeline:
-        rules = [
-            (img_size <= 1024 * 1536, (1, 1, 1, 1)),
-            (True, (2, 1, 1, 1)),
-        ]
-    elif engine.model_class == FluxPipeline:
-        rules = [
-            (img_size <= 512 * 512, (1, 1, 1, 1)),  # default
-            (img_size <= 1536 * 1536, (2, 1, 1, 1)),  # ulysses=2 2111
-            (True, (4, 1, 1, 1)),  # ulysses=2, ring=2, pipefusion=2 2212
-        ]
-    elif engine.model_class == CogVideoXPipeline:
-        rules = [
-            (img_size <= 768 * 1024 * 33, (1, 1, 1, 1)),
-            (img_size <= 1024 * 1024 * 65, (2, 1, 1, 1)),
-            (True, (4, 1, 1, 1)),
-        ]
-
-    elif engine.model_class == HunyuanVideoPipeline:
-        rules = [
-            (img_size <= 720 * 1280 * 17, (1, 1, 1, 1)),
-            (img_size <= 720 * 1280 * 33, (2, 1, 1, 1)),  # default
-            (img_size <= 720 * 1280 * 65, (4, 1, 1, 1)),  # ulysses=2 2111
-            (True, (8, 1, 1, 1)),  # ulysses=2, ring=2, pipefusion=2 2212
-        ]
-    elif num_frames <= 1:
-        rules = [
-            (img_size <= 256 * 128, (1, 1, 1, 1)),  # default
-            (img_size <= 256 * 256, (2, 1, 1, 1)),  # ulysses=2 2111
-            (img_size <= 256 * 512, (1, 4, 1, 1)),  # ulysses=2, pipefusion=2 2112
-            (img_size <= 512 * 512, (2, 2, 1, 1)),  # ulysses=2, ring=2 2211
-            (img_size <= 1024 * 512, (1, 1, 2, 2)),  # tensor=2, pipefusion=2 1122
-            (True, (2, 2, 1, 2)),  # ulysses=2, ring=2, pipefusion=2 2212
-        ]
+    best_degree = _pick_best_parallel_degree(profile_t_dict, max_degrees)
+    if best_degree is not None:
+        ulysses_degree = best_degree
+        ring_degree = 1
+        tensor_parallel_degree = 1
+        pipefusion_parallel_degree = 1
     else:
-        rules = [
-            (img_size <= 192 * 912 * 9, (1, 1, 1, 1)),  # default
-            (img_size <= 192 * 384 * 9, (2, 1, 1, 1)),  # ulysses=2 2111
-            (img_size <= 384 * 384 * 9, (4, 1, 1, 1)),  # ulysses=2, pipefusion=2 2112
-            (img_size <= 768 * 384 * 9, (2, 2, 1, 1)),  # ulysses=2, ring=2 2211
-            (img_size <= 768 * 768 * 9, (1, 1, 4, 1)),  # tensor=2, pipefusion=2 1122
-            (True, (2, 4, 1, 1)),  # ulysses=2, ring=2, pipefusion=2 2212
-        ]
+        # Random Ruled candidates in order: (condition, new degrees tuple)
+        if engine.model_class == HunyuanDiTPipeline:
+            rules = [
+                (img_size <= 768 * 768, (1, 1, 1, 1)),  # default
+                (img_size <= 1024 * 1024, (2, 1, 1, 1)),  # ulysses=2, ring=2 2211
+                (img_size <= 2048 * 2048, (4, 1, 1, 1)),  # tensor=2, pipefusion=2 1122
+                (True, (8, 1, 1, 1)),  # ulysses=2, ring=2, pipefusion=2 2212
+            ]
+        elif engine.model_class == StableDiffusion3Pipeline:
+            rules = [
+                (img_size <= 1024 * 1536, (1, 1, 1, 1)),
+                (True, (2, 1, 1, 1)),
+            ]
+        elif engine.model_class == FluxPipeline:
+            rules = [
+                (img_size <= 512 * 512, (1, 1, 1, 1)),  # default
+                (img_size <= 1536 * 1536, (2, 1, 1, 1)),  # ulysses=2 2111
+                (True, (4, 1, 1, 1)),  # ulysses=2, ring=2, pipefusion=2 2212
+            ]
+        elif engine.model_class == CogVideoXPipeline:
+            rules = [
+                (img_size <= 768 * 1024 * 33, (1, 1, 1, 1)),
+                (img_size <= 1024 * 1024 * 65, (2, 1, 1, 1)),
+                (True, (4, 1, 1, 1)),
+            ]
 
-    for condition, (uly, ring, tensor, pipe) in rules:
-        if condition:
-            total_degree = data_parallel_degree * uly * ring * tensor * pipe
-            if total_degree <= max_degrees:
-                ulysses_degree = uly
-                ring_degree = ring
-                tensor_parallel_degree = tensor
-                pipefusion_parallel_degree = pipe
-            break  # Only apply the first matching rule
+        elif engine.model_class == HunyuanVideoPipeline:
+            rules = [
+                (img_size <= 720 * 1280 * 17, (1, 1, 1, 1)),
+                (img_size <= 720 * 1280 * 33, (2, 1, 1, 1)),  # default
+                (img_size <= 720 * 1280 * 65, (4, 1, 1, 1)),  # ulysses=2 2111
+                (True, (8, 1, 1, 1)),  # ulysses=2, ring=2, pipefusion=2 2212
+            ]
+        elif num_frames <= 1:
+            rules = [
+                (img_size <= 256 * 128, (1, 1, 1, 1)),  # default
+                (img_size <= 256 * 256, (2, 1, 1, 1)),  # ulysses=2 2111
+                (img_size <= 256 * 512, (1, 4, 1, 1)),  # ulysses=2, pipefusion=2 2112
+                (img_size <= 512 * 512, (2, 2, 1, 1)),  # ulysses=2, ring=2 2211
+                (img_size <= 1024 * 512, (1, 1, 2, 2)),  # tensor=2, pipefusion=2 1122
+                (True, (2, 2, 1, 2)),  # ulysses=2, ring=2, pipefusion=2 2212
+            ]
+        else:
+            rules = [
+                (img_size <= 192 * 912 * 9, (1, 1, 1, 1)),  # default
+                (img_size <= 192 * 384 * 9, (2, 1, 1, 1)),  # ulysses=2 2111
+                (img_size <= 384 * 384 * 9, (4, 1, 1, 1)),  # ulysses=2, pipefusion=2 2112
+                (img_size <= 768 * 384 * 9, (2, 2, 1, 1)),  # ulysses=2, ring=2 2211
+                (img_size <= 768 * 768 * 9, (1, 1, 4, 1)),  # tensor=2, pipefusion=2 1122
+                (True, (2, 4, 1, 1)),  # ulysses=2, ring=2, pipefusion=2 2212
+            ]
+
+        for condition, (uly, ring, tensor, pipe) in rules:
+            if condition:
+                total_degree = data_parallel_degree * uly * ring * tensor * pipe
+                if total_degree <= max_degrees:
+                    ulysses_degree = uly
+                    ring_degree = ring
+                    tensor_parallel_degree = tensor
+                    pipefusion_parallel_degree = pipe
+                break  # Only apply the first matching rule
 
     if use_text_encoder_parallel:
 
