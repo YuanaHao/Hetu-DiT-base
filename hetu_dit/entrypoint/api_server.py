@@ -135,14 +135,28 @@ def _pick_best_parallel_degree(
 ) -> Optional[int]:
     if not profile_t_dict:
         return None
-    candidates = [
-        (int(k), float(v))
+    valid = {
+        int(k): float(v)
         for k, v in profile_t_dict.items()
         if int(k) > 0 and int(k) <= max_degrees and float(v) > 0
-    ]
-    if not candidates:
+    }
+    if not valid:
         return None
-    return min(candidates, key=lambda kv: kv[1])[0]
+
+    # Use profile efficiency criterion: choose the largest k with efficiency >= 80%.
+    # efficiency(k) = speedup(k) / k = (t1 / tk) / k
+    if 1 in valid:
+        t1 = valid[1]
+        best_k = 1
+        for k in sorted(valid):
+            tk = valid[k]
+            efficiency = (t1 / tk) / k
+            if efficiency >= 0.8 and k > best_k:
+                best_k = k
+        return best_k
+
+    # Fallback when profile data has no k=1 baseline.
+    return min(valid.items(), key=lambda kv: kv[1])[0]
 
 
 def find_machine_ilde_num(
