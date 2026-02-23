@@ -2,7 +2,7 @@ import time
 import logging
 import inspect
 import os
-from typing import Optional, Dict
+from typing import Optional, Dict, Iterable, Any
 import torch
 from pathlib import Path
 from collections import defaultdict
@@ -100,11 +100,26 @@ class Profiler:
         self.dict[tag]["start_time"] = self.timer()
         self.dict[tag]["config"] = config
 
+    @staticmethod
+    def _is_number(value: Any) -> bool:
+        return isinstance(value, (int, float))
+
+    @staticmethod
+    def _normalize_results(results: Any) -> Iterable:
+        if results is None:
+            return []
+        if isinstance(results, dict):
+            return [results]
+        if isinstance(results, (list, tuple)):
+            return results
+        return [results]
+
     def end(self, results, tag: str = "default", ranks: Optional[list] = None):
         if not self.log_setup:
             self._setup_logger()
         if tag not in self.dict:
             raise KeyError(f"Tag '{tag}' not found in profiler records")
+        results = list(self._normalize_results(results))
 
         times = []
         mems = []
@@ -115,30 +130,37 @@ class Profiler:
         stage_max_times = {}
         logger.debug(f"task_id is {tag}, results is {results}")
         for r in results:
+            if not isinstance(r, dict):
+                logger.debug(f"skip non-dict result entry: {r}")
+                continue
             logger.debug(f" come into results, is {r}")
-            exec_time = r["after"] - r["before"]
-            times.append(exec_time)
+            before_time = r.get("before")
+            after_time = r.get("after")
+            if self._is_number(before_time) and self._is_number(after_time):
+                times.append(after_time - before_time)
 
-            if "store" in r:
-                self.dict[tag]["end_time"] = r["store"]
+            store_time = r.get("store")
+            if self._is_number(store_time):
+                self.dict[tag]["end_time"] = store_time
             memory = None
-            if r["inner_results"]:
+            inner_results = r.get("inner_results")
+            if inner_results:
                 memory = []
                 for stage in stages:
-                    if stage in r["inner_results"]:
-                        stage_times[stage].append(r["inner_results"][stage])
+                    if stage in inner_results:
+                        stage_times[stage].append(inner_results[stage])
                     else:
                         stage_times[stage].append(-1)
-                    if f"{stage}_mem" in r["inner_results"]:
-                        memory.append(r["inner_results"][f"{stage}_mem"])
+                    if f"{stage}_mem" in inner_results:
+                        memory.append(inner_results[f"{stage}_mem"])
                     else:
                         memory.append(-1)
             mems.append(max(memory) if memory else 0)
 
-        max_time = max(times)
-        avg_time = sum(times) / len(times)
-        max_mem = max(mems)
-        avg_mem = sum(mems) / len(mems)
+        max_time = max(times) if times else 0.0
+        avg_time = sum(times) / len(times) if times else 0.0
+        max_mem = max(mems) if mems else 0.0
+        avg_mem = sum(mems) / len(mems) if mems else 0.0
 
         for stage in stages:
             if stage_times[stage]:
@@ -146,8 +168,35 @@ class Profiler:
                 stage_avg_times[stage] = sum(stage_times[stage]) / len(
                     stage_times[stage]
                 )
+            else:
+                stage_max_times[stage] = 0.0
+                stage_avg_times[stage] = 0.0
 
-        request_total_time = self.dict[tag]["end_time"] - self.dict[tag]["start_time"]
+        end_time = self.dict[tag].get("end_time")
+        if end_time is None:
+            after_candidates = [
+                r.get("after")
+                for r in results
+                if isinstance(r, dict) and self._is_number(r.get("after"))
+            ]
+            if after_candidates:
+                end_time = max(after_candidates)
+            else:
+                end_time = self.timer()
+            self.dict[tag]["end_time"] = end_time
+            logger.debug(
+                f"task_id is {tag}, no 'store' timestamp found; fallback end_time={end_time}"
+            )
+
+        start_time = self.dict[tag].get("start_time")
+        if not self._is_number(start_time):
+            start_time = end_time
+            self.dict[tag]["start_time"] = start_time
+            logger.debug(
+                f"task_id is {tag}, no valid 'start_time' found; fallback start_time={start_time}"
+            )
+
+        request_total_time = max(0.0, end_time - start_time)
         log_parts = [
             "",
             f"Task '{tag}' Completed",
