@@ -322,6 +322,10 @@ async def process_queue():
         engine.search_mode == "multi_machine_efficient_ilp"
         or engine.search_mode == "greedy_splitk"
     ):
+        queue_empty_count = 0
+        last_queue_empty_log_ts = 0.0
+        last_free_snapshot = None
+        last_state_summary = None
         while True:
             try:
                 """
@@ -331,9 +335,24 @@ async def process_queue():
                         f"[API Server] All tasks completed. Average latency: {avg_latency:.2f} seconds")
                     processed = False
                 """
+                refresh_start = time.time()
                 await engine.monitor.refresh()
+                refresh_elapsed = time.time() - refresh_start
                 meta = engine.detect_meta()  # use monitoring results
                 free = find_machine_ilde_num(meta)
+                state_summary = {}
+                for info in meta.values():
+                    state = info.get("state", "unknown")
+                    state_summary[state] = state_summary.get(state, 0) + 1
+                if refresh_elapsed > 1.0:
+                    logger.info(
+                        "[API Server] monitor.refresh is slow: %.3fs, queue_len=%d, state_summary=%s",
+                        refresh_elapsed,
+                        len(scheduler._queue),
+                        state_summary,
+                    )
+                last_free_snapshot = free
+                last_state_summary = state_summary
                 busy_machine_idle_time = None
                 (
                     task_id,
@@ -341,6 +360,7 @@ async def process_queue():
                     engine_config,
                     machine_id,
                 ) = await scheduler.get(free, busy_machine_idle_time)
+                queue_empty_count = 0
 
                 _update_result(task_id, status="processing")
                 processed = True
@@ -368,6 +388,21 @@ async def process_queue():
 
             except asyncio.QueueEmpty:
                 processed = False
+                queue_empty_count += 1
+                now_ts = time.time()
+                if (
+                    len(scheduler._queue) > 0
+                    and now_ts - last_queue_empty_log_ts >= 2.0
+                ):
+                    logger.info(
+                        "[API Server] Queue waiting in %s: queue_len=%d, consecutive_queue_empty=%d, free_per_machine=%s, worker_states=%s",
+                        engine.search_mode,
+                        len(scheduler._queue),
+                        queue_empty_count,
+                        last_free_snapshot,
+                        last_state_summary,
+                    )
+                    last_queue_empty_log_ts = now_ts
                 await asyncio.sleep(0.1)
             except Exception as e:
                 logger.error(f"[API Server] Error processing task: {e}")

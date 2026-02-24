@@ -1611,6 +1611,55 @@ class Efficient_ILP_Multi_Machine_Strategy(SchedulingStrategy, ABC):
         self.M = M  # Kept for compatibility, not used internally
         self.scheduled_tasks: List[Dict] = []  # Cached scheduled tasks
         self.model_profiler = model_profiler
+        self._last_interval_log_ts = 0.0
+        self._last_alloc_empty_log_ts = 0.0
+
+    def _log_alloc_empty_diagnostics(
+        self,
+        queue: List[Dict],
+        m_free: List[int],
+        now: float,
+    ) -> None:
+        if now - self._last_alloc_empty_log_ts < 2.0:
+            return
+        self._last_alloc_empty_log_ts = now
+
+        max_free = max(m_free) if m_free else 0
+        tasks_with_feasible_k = 0
+        tasks_blocked_by_capacity = 0
+        tasks_without_feasible_k = 0
+        sample_task_ids = []
+
+        for task in queue:
+            if len(sample_task_ids) < 3:
+                sample_task_ids.append(task.get("task_id"))
+            t_dict = task.get("t") or {}
+            t1 = t_dict.get(1, None)
+            feasible_k = []
+            if t1 is not None and t1 > 0:
+                for k in K_SET:
+                    tk = t_dict.get(k, None)
+                    if tk is None or tk <= 0:
+                        continue
+                    if (t1 / tk) / k >= EFF_TH:
+                        feasible_k.append(k)
+            if not feasible_k:
+                tasks_without_feasible_k += 1
+                continue
+            tasks_with_feasible_k += 1
+            if all(k > max_free for k in feasible_k):
+                tasks_blocked_by_capacity += 1
+
+        logger.info(
+            "[Scheduler][MM-ILP] alloc empty: queue_len=%d m_free=%s max_free=%s feasible_tasks=%d capacity_blocked=%d no_feasible_k=%d sample_tasks=%s",
+            len(queue),
+            m_free,
+            max_free,
+            tasks_with_feasible_k,
+            tasks_blocked_by_capacity,
+            tasks_without_feasible_k,
+            sample_task_ids,
+        )
 
     async def put(self, queue: List, priority_unused: int, item: Any, t_dict):
         """
@@ -1699,7 +1748,18 @@ class Efficient_ILP_Multi_Machine_Strategy(SchedulingStrategy, ABC):
                 task["engine_config"],
                 task["machine_id"],
             )
-        if now - self.last_sched < self.interval or not queue:
+        if now - self.last_sched < self.interval:
+            if queue and now - self._last_interval_log_ts >= 2.0:
+                wait_remaining = max(0.0, self.interval - (now - self.last_sched))
+                logger.info(
+                    "[Scheduler][MM-ILP] skip scheduling due to interval gate: queue_len=%d wait_remaining=%.3fs m_free=%s",
+                    len(queue),
+                    wait_remaining,
+                    m_free,
+                )
+                self._last_interval_log_ts = now
+            raise asyncio.QueueEmpty
+        if not queue:
             raise asyncio.QueueEmpty
 
         self.last_sched = now
@@ -1708,6 +1768,7 @@ class Efficient_ILP_Multi_Machine_Strategy(SchedulingStrategy, ABC):
             now, m_free, tasks=queue
         )  # [(task_id, k, m_id), ...]
         if not alloc:
+            self._log_alloc_empty_diagnostics(queue, m_free, now)
             raise asyncio.QueueEmpty
 
         for task_id, k, m_id in alloc:
